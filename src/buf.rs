@@ -129,20 +129,19 @@ impl Display for HBuf {
             Limit: {}\n\
             Position: {}\n\
             Has destructor: {}\n\
-            ", self.data_ptr, self.data_ptr.add(self.capacity), self.capacity, self.limit, self.position, self.destructor.is_some())?;
-            write!(f, "Reference count: {}\n",  Arc::strong_count(&self.destructor))?;
-            write!(f, "=============================================================================")?;
+            Reference count: {}\n\
+            =============================================================================",
+                   self.data_ptr,
+                   self.data_ptr.add(self.capacity),
+                   self.capacity,
+                   self.limit,
+                   self.position,
+                   self.destructor.is_some(),
+                   Arc::strong_count(&self.destructor))?;
+
 
             for idx_base in (0..self.capacity).step_by(16) {
-                write!(f, "\n")?;
-                #[cfg(target_pointer_width = "16")]
-                write!(f, "0x{:04x}:", self.data_ptr.ptr().add(idx_base) as usize)?;
-                #[cfg(target_pointer_width = "32")]
-                write!(f, "0x{:08x}:", self.data_ptr.ptr().add(idx_base) as usize)?;
-                #[cfg(target_pointer_width = "64")]
-                write!(f, "0x{:016x}:", self.data_ptr.ptr().add(idx_base) as usize)?;
-                #[cfg(target_pointer_width = "128")]
-                write!(f, "0x{:032x}:", self.data_ptr.ptr().add(idx_base) as usize)?;
+                write!(f, "\n0x{:0width$x}:", self.data_ptr.ptr().add(idx_base) as usize, width = (usize::BITS / 4) as usize)?;
 
                 for idx in 0..16usize {
                     if idx & 1 == 0 {
