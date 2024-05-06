@@ -20,7 +20,7 @@ fn test_destructor_called() {
     test_it(null_mut(), 2);
 
 
-    let hb = unsafe { heap_buffer::HBuf::from_raw_parts_with_destructor(ptr, 16, test_it) };
+    let hb = unsafe { heapbuf::HBuf::from_raw_parts_with_destructor(ptr, 16, test_it) };
     drop(hb);
     assert_eq!(ptr, PTR.load(Ordering::SeqCst));
     assert_eq!(16, SZ.load(Ordering::SeqCst));

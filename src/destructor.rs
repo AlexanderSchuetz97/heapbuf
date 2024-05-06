@@ -5,34 +5,32 @@ use crate::sync_ptr::SyncPtr;
 pub(crate) struct HBufDestructor {
     data_ptr: SyncPtr,
     capacity: usize,
-    destructor_info: usize,
-    destructor: fn(*mut u8, usize, usize)
+    destructor_info: HBufDestructorInfo
+}
+
+#[derive(Debug)]
+pub(crate) enum HBufDestructorInfo {
+    Layout(Layout),
+    Destructor(fn(*mut u8, usize))
 }
 
 impl HBufDestructor {
-    pub(crate) fn new(data_ptr: *mut u8, capacity: usize, destructor_info: usize, destructor: fn(*mut u8, usize, usize)) -> HBufDestructor {
+    pub(crate) fn new(data_ptr: *mut u8, capacity: usize, destructor_info: HBufDestructorInfo) -> HBufDestructor {
         return HBufDestructor {
             data_ptr: data_ptr.into(),
             capacity,
-            destructor_info,
-            destructor,
+            destructor_info
         }
     }
 }
 
 impl Drop for HBufDestructor {
     fn drop(&mut self) {
-        (self.destructor)(self.data_ptr.ptr(), self.capacity, self.destructor_info);
+        match self.destructor_info {
+            HBufDestructorInfo::Layout(lay) => unsafe { std::alloc::dealloc(self.data_ptr.ptr(), lay) }
+            HBufDestructorInfo::Destructor(destructor_fn) => destructor_fn(self.data_ptr.ptr(), self.capacity)
+        }
     }
-}
-
-pub(crate) fn call_destructor(data: *mut u8, size: usize, destructor: usize) {
-    let destr: fn(*mut u8, usize) = unsafe {std::mem::transmute(destructor)};
-    destr(data, size);
-}
-
-pub(crate) fn call_dealloc(data: *mut u8, size: usize, alignment: usize) {
-    unsafe { std::alloc::dealloc(data, Layout::from_size_align_unchecked(size, alignment)) }
 }
 
 #[cfg(test)]

@@ -1,12 +1,13 @@
 use std::alloc::{Layout, LayoutError};
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Binary, Debug, Display, Formatter, LowerHex, UpperHex};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::{align_of, size_of};
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::sync::Arc;
-use crate::destructor;
-use crate::destructor::HBufDestructor;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use crate::destructor::{HBufDestructor, HBufDestructorInfo};
 use crate::sync_ptr::SyncPtr;
 
 pub enum HBufError {
@@ -53,7 +54,253 @@ pub struct HBuf {
     capacity: usize,
     limit: usize,
     position: usize,
-    destructor: Option<Arc<HBufDestructor>>
+    destructor: Arc<Option<HBufDestructor>>
+}
+impl Hash for HBuf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write(self.as_slice());
+    }
+}
+
+///
+/// This implementation does not strip leading 0s.
+/// Length of the format result will always be capacity*8
+///
+impl Binary for HBuf {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        unsafe {
+            for x in 0..self.capacity {
+                write!(f, "{:08o}", *self.data_ptr.add(x))?;
+            }
+        }
+
+        return Ok(());
+    }
+}
+
+///
+/// This implementation does not strip leading 0s.
+/// Length of the format result will always be capacity*2
+///
+impl LowerHex for HBuf {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        unsafe {
+            for x in 0..self.capacity {
+                write!(f, "{:02x}", *self.data_ptr.add(x))?;
+            }
+        }
+
+        return Ok(());
+    }
+}
+
+///
+/// This implementation does not strip leading 0s.
+/// Length of the format result will always be capacity*2
+///
+impl UpperHex for HBuf {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        unsafe {
+            for x in 0..self.capacity {
+                write!(f, "{:02X}", *self.data_ptr.add(x))?;
+            }
+        }
+
+        return Ok(());
+    }
+}
+
+
+
+///
+/// This formats the "metadata" such as capacity/limit/position/ref-count of the HBuf plus all the data
+/// in a Human-Readable form.
+///
+/// The data is formatted as a hex dump similar to what the application xxd would output if the buffer contents were
+/// written out to a file and "xxd <filename>" were to be called on the file.
+///
+impl Display for HBuf {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        unsafe {
+            write!(f, "\
+            =============================================================================\n\
+            Address: {:p}-{:p}\n\
+            Capacity: {}\n\
+            Limit: {}\n\
+            Position: {}\n\
+            Has destructor: {}\n\
+            ", self.data_ptr, self.data_ptr.add(self.capacity), self.capacity, self.limit, self.position, self.destructor.is_some())?;
+            write!(f, "Reference count: {}\n",  Arc::strong_count(&self.destructor))?;
+            write!(f, "=============================================================================")?;
+
+            for idx_base in (0..self.capacity).step_by(16) {
+                write!(f, "\n")?;
+                #[cfg(target_pointer_width = "16")]
+                write!(f, "0x{:04x}:", self.data_ptr.ptr().add(idx_base) as usize)?;
+                #[cfg(target_pointer_width = "32")]
+                write!(f, "0x{:08x}:", self.data_ptr.ptr().add(idx_base) as usize)?;
+                #[cfg(target_pointer_width = "64")]
+                write!(f, "0x{:016x}:", self.data_ptr.ptr().add(idx_base) as usize)?;
+                #[cfg(target_pointer_width = "128")]
+                write!(f, "0x{:032x}:", self.data_ptr.ptr().add(idx_base) as usize)?;
+
+                for idx in 0..16usize {
+                    if idx & 1 == 0 {
+                        write!(f, " ")?;
+                    }
+                    if idx_base+idx >= self.capacity {
+                        write!(f, "  ")?;
+                        continue;
+                    }
+                    write!(f, "{:02x}", *self.data_ptr.ptr().add(idx+idx_base))?;
+                }
+                write!(f, "  ")?;
+
+                for idx in 0..16usize {
+                    if idx_base+idx >= self.capacity {
+                        write!(f, " ")?;
+                        continue;
+                    }
+                    let data = (*self.data_ptr.ptr().add(idx+idx_base)) as char;
+                    if char::is_ascii_graphic(&data) {
+                        write!(f, "{}", data)?;
+                    } else {
+                        write!(f, ".")?;
+                    }
+                }
+            }
+
+            write!(f, "\n=============================================================================")?;
+            return Ok(());
+        }
+    }
+}
+
+macro_rules! atomic_type {
+    ($type:ty, $atomic:ty, $as_slice_name:ident, $as_atomic:ident, $load_name:ident, $store_name:ident,  $swap_name:ident, $cas_name:ident, $cas_weak_name:ident) => {
+
+        ///
+        /// Returns a slice of Atomic "references" to the buffer.
+        /// The "references" remain valid even if the buffer limit changes.
+        ///
+        /// This function requires the alignment of the buffer to match the alignment of the type.
+        /// If the buffer is not properly aligned then this function returns None.
+        ///
+        ///
+        #[inline]
+        pub fn $as_slice_name(&self) -> Option<&[$atomic]> {
+            if self.data_ptr.align_offset(align_of::<$atomic>()) != 0 {
+                return None;
+            }
+            unsafe {
+                return Some(std::slice::from_raw_parts(self.data_ptr.ptr().cast::<$atomic>(), self.limit / size_of::<$atomic>()));
+            }
+
+        }
+
+        ///
+        /// Returns a Atomic "reference" of a given type to a index.
+        /// The "reference" remains usable even if the limit changes.
+        ///
+        /// This function requires the alignment of the index to match the alignment of the type.
+        /// If the index is not properly aligned or the index is out of bounds then this function returns None.
+        ///
+        ///
+        #[inline]
+        pub fn $as_atomic(&self, index: usize) -> Option<&$atomic> {
+            let sz = size_of::<$atomic>();
+            if index+sz-1 >= self.limit {
+                return None;
+            }
+            let ptr = self.data_ptr.wrapping_add(index);
+            if ptr.align_offset(align_of::<$atomic>()) != 0 {
+                return None;
+            }
+            unsafe {
+                return Some(<$atomic>::from_ptr(ptr.cast::<$type>()));
+            }
+        }
+
+        ///
+        /// Atomic "get" with memory ordering semantics.
+        ///
+        #[inline]
+        pub fn $load_name(&self, index: usize, ordering: Ordering) -> $type {
+            let sz = size_of::<$atomic>();
+            if index+sz-1 >= self.limit {
+                panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
+            }
+            let ptr = self.data_ptr.wrapping_add(index);
+            debug_assert_eq!(ptr.align_offset(align_of::<$atomic>()), 0);
+            unsafe {
+                return <$atomic>::from_ptr(ptr.cast::<$type>()).load(ordering);
+            }
+        }
+
+        ///
+        /// Atomic "set" with memory ordering semantics.
+        ///
+        #[inline]
+        pub fn $store_name(&self, index: usize, value: $type, ordering: Ordering) {
+            let sz = size_of::<$atomic>();
+            if index+sz-1 >= self.limit {
+                panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
+            }
+            let ptr = self.data_ptr.wrapping_add(index);
+            debug_assert_eq!(ptr.align_offset(align_of::<$atomic>()), 0);
+            unsafe {
+                return <$atomic>::from_ptr(ptr.cast::<$type>()).store(value, ordering);
+            }
+        }
+
+        ///
+        /// Atomic "swap" with memory ordering semantics.
+        ///
+        #[inline]
+        pub fn $swap_name(&self, index: usize, value: $type, ordering: Ordering) -> $type {
+            let sz = size_of::<$atomic>();
+            if index+sz-1 >= self.limit {
+                panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
+            }
+            let ptr = self.data_ptr.wrapping_add(index);
+            debug_assert_eq!(ptr.align_offset(align_of::<$atomic>()), 0);
+            unsafe {
+                return <$atomic>::from_ptr(ptr.cast::<$type>()).swap(value, ordering);
+            }
+        }
+
+        ///
+        /// Atomic "compare_exchange" with memory ordering semantics.
+        ///
+        #[inline]
+        pub fn $cas_name(&self, index: usize, current: $type, update: $type, success_ordering: Ordering, failure_ordering: Ordering) -> Result<$type, $type> {
+            let sz = size_of::<$atomic>();
+            if index+sz-1 >= self.limit {
+                panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
+            }
+            let ptr = self.data_ptr.wrapping_add(index);
+            debug_assert_eq!(ptr.align_offset(align_of::<$atomic>()), 0);
+            unsafe {
+                return <$atomic>::from_ptr(ptr.cast::<$type>()).compare_exchange(current, update, success_ordering, failure_ordering);
+            }
+        }
+
+        ///
+        /// Atomic "compare_exchange_weak" with memory ordering semantics.
+        ///
+        #[inline]
+        pub fn $cas_weak_name(&self, index: usize, current: $type, update: $type, success_ordering: Ordering, failure_ordering: Ordering) -> Result<$type, $type> {
+            let sz = size_of::<$atomic>();
+            if index+sz-1 >= self.limit {
+                panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
+            }
+            let ptr = self.data_ptr.wrapping_add(index);
+            debug_assert_eq!(ptr.align_offset(align_of::<$atomic>()), 0);
+            unsafe {
+                return <$atomic>::from_ptr(ptr.cast::<$type>()).compare_exchange_weak(current, update, success_ordering, failure_ordering);
+            }
+        }
+    }
 }
 
 macro_rules! known_type {
@@ -97,7 +344,7 @@ macro_rules! known_type {
         /// The value is read using read_unaligned.
         /// panics on out of bounds.
         ///
-        pub fn $set_name<T: Sized>(&self, index: usize, value: $type) {
+        pub fn $set_name<T: Sized>(&mut self, index: usize, value: $type) {
             let sz = size_of::<$type>()-1;
             if index+sz >= self.limit {
                 panic!("Index {} is out of bounds for HBuf with limit {}", index+sz, self.limit);
@@ -120,7 +367,7 @@ impl HBuf {
             capacity: size,
             limit: size,
             position: 0,
-            destructor: None
+            destructor: Arc::new(None)
         }
     }
 
@@ -131,23 +378,116 @@ impl HBuf {
     ///
     pub unsafe fn from_raw_parts_with_destructor(data: *mut u8, size: usize, destructor: fn(*mut u8, usize)) -> HBuf {
 
-        let addr: usize = unsafe {std::mem::transmute(destructor)};
+
+        //let addr: usize = unsafe {std::mem::transmute(destructor)};
 
         return HBuf {
             data_ptr: data.into(),
             capacity: size,
             limit: size,
             position: 0,
-            destructor: Some(Arc::new(HBufDestructor::new(data, size, addr, destructor::call_destructor)))
+            destructor: Arc::new(Some(HBufDestructor::new(data, size, HBufDestructorInfo::Destructor(destructor))))
         }
+    }
+
+    ///
+    /// Allocates the given amount of memory with no particular alignment.
+    /// This function panics/aborts if the amount of memory could not be allocated.
+    /// (It calls std::alloc::handle_alloc_error on out of memory)
+    ///
+    pub fn allocate(size: usize) -> HBuf {
+        return HBuf::allocate_aligned(size, 1);
+    }
+
+    ///
+    /// Allocates the given amount of memory with no particular alignment.
+    /// This function panics/aborts if the amount of memory could not be allocated.
+    /// (It calls std::alloc::handle_alloc_error on out of memory)
+    ///
+    pub fn allocate_zeroed(size: usize) -> HBuf {
+        return HBuf::allocate_aligned_zeroed(size, 1);
+    }
+
+    ///
+    /// Allocates the given mount of memory with the given alignment.
+    /// This function panics if the alignment is invalid.
+    /// This function panics/aborts if the amount of memory could not be allocated.
+    /// (It calls std::alloc::handle_alloc_error on out of memory)
+    ///
+    pub fn allocate_aligned_zeroed(size: usize, alignment: usize) -> HBuf {
+        let mut buf =  HBuf::allocate_aligned(size, alignment);
+        buf.fill(0);
+        return buf;
+    }
+
+    ///
+    /// Allocates the given mount of memory with the given alignment.
+    /// This function panics if the alignment is invalid.
+    /// This function panics/aborts if the amount of memory could not be allocated.
+    /// (It calls std::alloc::handle_alloc_error on out of memory)
+    ///
+    #[allow(unreachable_code)]
+    pub fn allocate_aligned(size: usize, alignment: usize) -> HBuf {
+        if size == 0 {
+            panic!("size is 0");
+        }
+
+        if alignment == 0 {
+            panic!("alignment is 0");
+        }
+
+        let layout = Layout::from_size_align(size, alignment);
+        if layout.is_err() {
+            panic!("LayoutError when creating layout for size {} alignment {}", size, alignment);
+        }
+        let layout = layout.unwrap();
+        let data = unsafe {std::alloc::alloc(layout)};
+        if data.is_null() {
+            std::alloc::handle_alloc_error(layout);
+            panic!("handle_alloc_error failed to panic or abort after OutOfMemory!");
+        }
+
+        return HBuf {
+            data_ptr: data.into(),
+            capacity: size,
+            limit: size,
+            position: 0,
+            destructor: Arc::new(Some(HBufDestructor::new(data, size, HBufDestructorInfo::Layout(layout))))
+        };
     }
 
     ///
     /// Allocates memory using the standard rust allocator.
     /// The memory does not have any particular alignment.
     ///
-    pub fn allocate(size: usize) -> Result<HBuf, HBufError> {
-        return HBuf::allocate_aligned(size, 1);
+    pub fn try_allocate(size: usize) -> Result<HBuf, HBufError> {
+        return HBuf::try_allocate_aligned(size, 1);
+    }
+
+    ///
+    /// Allocates memory using the standard rust allocator.
+    /// The memory does not have any particular alignment.
+    ///
+    /// If the allocation is successful then it is zeroed out.
+    ///
+    pub fn try_allocate_zeroed(size: usize) -> Result<HBuf, HBufError> {
+        let mut buf = HBuf::try_allocate_aligned(size, 1)?;
+        buf.fill(0);
+        return Ok(buf);
+    }
+
+    ///
+    /// Allocates memory using the standard rust allocator.
+    /// The memory will be aligned to the given alignment.
+    ///
+    /// This function will fail if the allocator cannot allocate memory or allocates memory that does not have the desired alignment.
+    ///
+    /// If the allocation is successful then it is zeroed out.
+    ///
+    pub fn try_allocate_aligned_zeroed(size: usize, alignment: usize) -> Result<HBuf, HBufError> {
+        let mut buf = HBuf::try_allocate_aligned(size, alignment)?;
+        buf.fill(0);
+        return Ok(buf);
     }
 
     ///
@@ -157,7 +497,7 @@ impl HBuf {
     /// This function will fail if the allocator cannot allocate memory or allocates memory that does not have the desired alignment.
     ///
     ///
-    pub fn allocate_aligned(size: usize, alignment: usize) -> Result<HBuf, HBufError> {
+    pub fn try_allocate_aligned(size: usize, alignment: usize) -> Result<HBuf, HBufError> {
         if size == 0 || alignment == 0 {
             return Err(HBufError::LayoutError);
         }
@@ -178,8 +518,24 @@ impl HBuf {
             capacity: size,
             limit: size,
             position: 0,
-            destructor: Some(Arc::new(HBufDestructor::new(data, size, 1, destructor::call_dealloc)))
+            destructor: Arc::new(Some(HBufDestructor::new(data, size, HBufDestructorInfo::Layout(layout))))
         });
+    }
+
+
+
+    ///
+    /// Returns the reference count of the HBuf.
+    ///
+    pub fn ref_count(&self) -> usize {
+        return Arc::strong_count(&self.destructor);
+    }
+
+    ///
+    /// Returns true if this HBuf has a destructor that will run when all references to the HBuf are dropped.
+    ///
+    pub fn has_destructor(&self) -> bool {
+        return self.destructor.is_none();
     }
 
     ///
@@ -317,7 +673,7 @@ impl HBuf {
     /// The alignment of T and the memory location does not matter as this method uses "write_unaligned"
     /// to write memory.
     ///
-    pub unsafe fn set<T: Sized>(&self, index: usize, value: T) {
+    pub unsafe fn set<T: Sized>(&mut self, index: usize, value: T) {
         let sz = size_of::<T>();
         if index+sz-1 >= self.limit {
             panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
@@ -336,6 +692,9 @@ impl HBuf {
     known_type!(u32, as_slice_u32, as_mut_slice_u32, get_u32, set_u32);
     known_type!(u64, as_slice_u64, as_mut_slice_u64, get_u64, set_u64);
     known_type!(u128, as_slice_u128, as_mut_slice_u128, get_u128, set_u128);
+
+    known_type!(usize, as_slice_usize, as_mut_slice_usize, get_usize, set_usize);
+    known_type!(isize, as_slice_isize, as_mut_slice_isize, get_isize, set_isize);
 
     known_type!(f32, as_slice_f32, as_mut_slice_f32, get_f32, set_f32);
     known_type!(f64, as_slice_f64, as_mut_slice_f64, get_f64, set_f64);
@@ -378,6 +737,165 @@ impl HBuf {
 
     #[cfg(feature = "f128_support")]
     known_type!(f128::f128, as_slice_f128, as_mut_slice_f128, get_f128, set_f128);
+
+    #[cfg(target_has_atomic = "8")]
+    atomic_type!(u8, std::sync::atomic::AtomicU8, as_slice_atomic_u8, as_atomic_u8, load_u8, store_u8, swap_u8, compare_and_exchange_u8, compare_and_exchange_weak_u8);
+
+    #[cfg(target_has_atomic = "8")]
+    atomic_type!(i8, std::sync::atomic::AtomicI8, as_slice_atomic_i8, as_atomic_i8, load_i8, store_i8, swap_i8, compare_and_exchange_i8, compare_and_exchange_weak_i8);
+
+    #[cfg(target_has_atomic = "16")]
+    atomic_type!(u16, std::sync::atomic::AtomicU16, as_slice_atomic_u16, as_atomic_u16, atomic_load_u16, store_u16, swap_u16, compare_and_exchange_u16, compare_and_exchange_weak_u16);
+
+    #[cfg(target_has_atomic = "16")]
+    atomic_type!(i16, std::sync::atomic::AtomicI16, as_slice_atomic_i16, as_atomic_i16, atomic_load_i16, store_i16, swap_i16, compare_and_exchange_i16, compare_and_exchange_weak_i16);
+
+    #[cfg(target_has_atomic = "32")]
+    atomic_type!(u32, std::sync::atomic::AtomicU32, as_slice_atomic_u32, as_atomic_u32, atomic_load_u32, atomic_store_u32, atomic_swap_u32, atomic_compare_and_exchange_u32, atomic_compare_and_exchange_weak_u32);
+
+    #[cfg(target_has_atomic = "32")]
+    atomic_type!(i32, std::sync::atomic::AtomicI32, as_slice_atomic_i32, as_atomic_i32, atomic_load_i32, atomic_store_i32, atomic_swap_i32, atomic_compare_and_exchange_i32, atomic_compare_and_exchange_weak_i32);
+
+    #[cfg(target_has_atomic = "64")]
+    atomic_type!(u64, std::sync::atomic::AtomicU64, as_slice_atomic_u64, as_atomic_u64, atomic_load_u64, atomic_store_u64, atomic_swap_u64, atomic_compare_and_exchange_u64, atomic_compare_and_exchange_weak_u64);
+
+    #[cfg(target_has_atomic = "64")]
+    atomic_type!(i64, std::sync::atomic::AtomicI64, as_slice_atomic_i64, as_atomic_i64, atomic_load_i64, atomic_store_i64, atomic_swap_i64, atomic_compare_and_exchange_i64, atomic_compare_and_exchange_weak_i64);
+
+    #[cfg(target_has_atomic = "ptr")]
+    atomic_type!(usize, std::sync::atomic::AtomicUsize, as_slice_atomic_usize, as_atomic_usize, atomic_load_usize, atomic_store_usize, atomic_swap_usize, atomic_compare_and_exchange_usize, atomic_compare_and_exchange_weak_usize);
+
+    #[cfg(target_has_atomic = "ptr")]
+    atomic_type!(isize, std::sync::atomic::AtomicIsize, as_slice_atomic_isize, as_atomic_isize, atomic_load_isize, atomic_store_isize, atomic_swap_isize, atomic_compare_and_exchange_isize, atomic_compare_and_exchange_weak_isize);
+
+     ///
+    /// Returns a slice of Atomic "references" to the buffer.
+    /// The "references" remain valid even if the buffer limit changes.
+    ///
+    /// This function requires the alignment of the buffer to match the pointer alignment.
+    /// If the buffer is not properly aligned then this function returns None.
+    ///
+    ///
+    #[cfg(target_has_atomic = "ptr")]
+    #[inline]
+    pub fn as_slice_atomic_ptr<T>(&self) -> Option<&[AtomicPtr<T>]> {
+        if self.data_ptr.align_offset(align_of::<AtomicPtr<T>>()) != 0 {
+            return None;
+        }
+        unsafe {
+            return Some(std::slice::from_raw_parts(self.data_ptr.ptr().cast::<AtomicPtr<T>>(), self.limit / size_of::<AtomicPtr<T>>()));
+        }
+    }
+
+    ///
+    /// Returns a Atomic "reference" of a given type to a index.
+    /// The "reference" remains usable even if the limit changes.
+    ///
+    /// This function requires the alignment of the index to match the alignment of the type.
+    /// If the index is not properly aligned or the index is out of bounds then this function returns None.
+    ///
+    ///
+    #[cfg(target_has_atomic = "ptr")]
+    #[inline]
+    pub fn as_atomic_ptr<T>(&self, index: usize) -> Option<&AtomicPtr<T>> {
+        let sz = size_of::<AtomicPtr<T>>();
+        if index+sz-1 >= self.limit {
+            return None;
+        }
+        let ptr = self.data_ptr.wrapping_add(index);
+        if ptr.align_offset(align_of::<AtomicPtr<T>>()) != 0 {
+            return None;
+        }
+        unsafe {
+            return Some(<AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()));
+        }
+    }
+
+    ///
+    /// Atomic "get" with memory ordering semantics.
+    ///
+    #[cfg(target_has_atomic = "ptr")]
+    #[inline]
+    pub fn atomic_load_ptr<T>(&self, index: usize, ordering: Ordering) -> *mut T {
+        let sz = size_of::<AtomicPtr<T>>();
+        if index+sz-1 >= self.limit {
+            panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
+        }
+        let ptr = self.data_ptr.wrapping_add(index);
+        debug_assert_eq!(ptr.align_offset(align_of::<AtomicPtr<T>>()), 0);
+        unsafe {
+            return <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).load(ordering);
+        }
+    }
+
+    ///
+    /// Atomic "set" with memory ordering semantics.
+    ///
+    #[cfg(target_has_atomic = "ptr")]
+    #[inline]
+    pub fn atomic_store_ptr<T>(&self, index: usize, value: *mut T, ordering: Ordering) {
+        let sz = size_of::<AtomicPtr<T>>();
+        if index+sz-1 >= self.limit {
+            panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
+        }
+        let ptr = self.data_ptr.wrapping_add(index);
+        debug_assert_eq!(ptr.align_offset(align_of::<AtomicPtr<T>>()), 0);
+        unsafe {
+            return <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).store(value, ordering);
+        }
+    }
+
+    ///
+    /// Atomic "swap" with memory ordering semantics.
+    ///
+    #[cfg(target_has_atomic = "ptr")]
+    #[inline]
+    pub fn atomic_swap_ptr<T>(&self, index: usize, value: *mut T, ordering: Ordering) -> *mut T {
+        let sz = size_of::<AtomicPtr<T>>();
+        if index+sz-1 >= self.limit {
+            panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
+        }
+        let ptr = self.data_ptr.wrapping_add(index);
+        debug_assert_eq!(ptr.align_offset(align_of::<AtomicPtr<T>>()), 0);
+        unsafe {
+            return <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).swap(value, ordering);
+        }
+    }
+
+    ///
+    /// Atomic "compare_exchange" with memory ordering semantics.
+    ///
+    #[cfg(target_has_atomic = "ptr")]
+    #[inline]
+    pub fn atomic_compare_exchange_ptr<T>(&self, index: usize, current: *mut T, update: *mut T, success_ordering: Ordering, failure_ordering: Ordering) -> Result<*mut T, *mut T> {
+        let sz = size_of::<AtomicPtr<T>>();
+        if index+sz-1 >= self.limit {
+            panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
+        }
+        let ptr = self.data_ptr.wrapping_add(index);
+        debug_assert_eq!(ptr.align_offset(align_of::<AtomicPtr<T>>()), 0);
+        unsafe {
+            return <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).compare_exchange(current, update, success_ordering, failure_ordering);
+        }
+    }
+
+    ///
+    /// Atomic "compare_exchange_weak" with memory ordering semantics.
+    ///
+    #[cfg(target_has_atomic = "ptr")]
+    #[inline]
+    pub fn atomic_compare_exchange_weak_ptr<T>(&self, index: usize, current: *mut T, update: *mut T, success_ordering: Ordering, failure_ordering: Ordering) -> Result<*mut T, *mut T> {
+        let sz = size_of::<AtomicPtr<T>>();
+        if index+sz-1 >= self.limit {
+            panic!("Index {} is out of bounds for HBuf with limit {}", index+sz-1, self.limit);
+        }
+        let ptr = self.data_ptr.wrapping_add(index);
+        debug_assert_eq!(ptr.align_offset(align_of::<AtomicPtr<T>>()), 0);
+        unsafe {
+            return <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).compare_exchange(current, update, success_ordering, failure_ordering);
+        }
+    }
+
 
     ///
     /// Changes the limit of accessible bytes in the buffer.
@@ -450,6 +968,14 @@ impl HBuf {
     ///
     pub fn flip(&mut self) {
         self.limit = self.position;
+        self.position = 0;
+    }
+
+    ///
+    /// Resets position and limit.
+    ///
+    pub fn reset(&mut self) {
+        self.limit = self.capacity;
         self.position = 0;
     }
 

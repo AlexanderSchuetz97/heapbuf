@@ -36,6 +36,8 @@ impl Deref for SyncPtr {
 }
 
 impl DerefMut for SyncPtr {
+
+    #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }

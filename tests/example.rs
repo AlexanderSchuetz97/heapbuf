@@ -1,29 +1,3 @@
-# heapbuf
-Rust library that implements a fixed size heap buffer with optional custom alignment, ref counting and custom destructor logic.
-
-For convenient use within rust the buffer also implements the Read/Write and Seek traits.
-Reading/Writing/Seeking beyond the bounds of the buffer will trigger UnexpectedEof errors.
-
-# Use case
-This library was developed for two primary purposes:
-1. to interact with C code that either gives rust ownership of heap buffers/objects that require a manual free
-to return ownership back to the C code once rust is done with it. 
-2. to interact with C code that requires fixed size buffers with a custom alignment as input.
-
-# Features
-This library supports the following crates and their datatypes
-- half_support: half crate f16 type 
-- f128_support: f128 crate f128 type
-- uintx_support: uintx crate u24 type up to u120 type 
-
-If you would like to enable all features then for your convenience a "all" feature exists.
-```toml
-[dependencies]
-heapbuf = {version = "0.0.1", features = ["all"]}
-```
-
-# Examples
-```rust
 use std::mem::{align_of, size_of};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::thread;
@@ -129,4 +103,3 @@ pub fn test() {
         assert_eq!(slice.len(), 2);
     }
 }
-```
