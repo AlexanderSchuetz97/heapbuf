@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "heapbuf"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "f128",
  "half",
@@ -182,6 +182,6 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "uintx"
-version = "0.0.2"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "373c79f453296fd11e411177f3fb753d03a9026c83edd1366e0e4d406b1717e5"
+checksum = "577f4e8a5354aef747e4b33a9d2694c2065849e29be16925a2cd96c33e150f29"

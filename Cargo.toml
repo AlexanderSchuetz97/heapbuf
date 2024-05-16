@@ -1,6 +1,6 @@
 [package]
 name = "heapbuf"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Alexander Schütz <aschuetz@protonmail.com>"]
@@ -14,7 +14,7 @@ repository = "https://github.com/AlexanderSchuetz97/heapbuf"
 [dependencies]
 half = { version = "^2.4.1", optional = true}
 f128 = { version = "^0.2.9", optional = true}
-uintx = { version = "^0.0.2", optional = true}
+uintx = { version = "^0.1.0", optional = true}
 
 [features]
 all = ["uintx_support", "f16_support", "f128_support"]
