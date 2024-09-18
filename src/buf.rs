@@ -7,8 +7,8 @@ use std::mem::{align_of, size_of};
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use sync_ptr::{FromMutPtr, SyncMutPtr};
 use crate::destructor::{HBufDestructor, HBufDestructorInfo};
-use crate::sync_ptr::SyncPtr;
 
 pub enum HBufError {
     ZeroSize,
@@ -50,7 +50,7 @@ impl Debug for HBufError {
 
 #[derive(Debug)]
 pub struct HBuf {
-    data_ptr: SyncPtr,
+    data_ptr: SyncMutPtr<u8>,
     capacity: usize,
     limit: usize,
     position: usize,
@@ -141,7 +141,7 @@ impl Display for HBuf {
 
 
             for idx_base in (0..self.capacity).step_by(16) {
-                write!(f, "\n0x{:0width$x}:", self.data_ptr.ptr().add(idx_base) as usize, width = (usize::BITS / 4) as usize)?;
+                write!(f, "\n0x{:0width$x}:", self.data_ptr.add(idx_base) as usize, width = (usize::BITS / 4) as usize)?;
 
                 for idx in 0..16usize {
                     if idx & 1 == 0 {
@@ -151,7 +151,7 @@ impl Display for HBuf {
                         write!(f, "  ")?;
                         continue;
                     }
-                    write!(f, "{:02x}", *self.data_ptr.ptr().add(idx+idx_base))?;
+                    write!(f, "{:02x}", *self.data_ptr.add(idx+idx_base))?;
                 }
                 write!(f, "  ")?;
 
@@ -160,7 +160,7 @@ impl Display for HBuf {
                         write!(f, " ")?;
                         continue;
                     }
-                    let data = (*self.data_ptr.ptr().add(idx+idx_base)) as char;
+                    let data = (*self.data_ptr.add(idx+idx_base)) as char;
                     if char::is_ascii_graphic(&data) {
                         write!(f, "{}", data)?;
                     } else {
@@ -192,7 +192,7 @@ macro_rules! atomic_type {
                 return None;
             }
             unsafe {
-                return Some(std::slice::from_raw_parts(self.data_ptr.ptr().cast::<$atomic>(), self.limit / size_of::<$atomic>()));
+                return Some(std::slice::from_raw_parts(self.data_ptr.inner().cast::<$atomic>(), self.limit / size_of::<$atomic>()));
             }
 
         }
@@ -312,7 +312,7 @@ macro_rules! known_type {
             if self.data_ptr.align_offset(align_of::<$type>()) != 0 {
                 return None;
             }
-            return unsafe { Some(std::slice::from_raw_parts(self.data_ptr.ptr().cast::<$type>(), self.limit / size_of::<$type>()))};
+            return unsafe { Some(std::slice::from_raw_parts(self.data_ptr.inner().cast::<$type>(), self.limit / size_of::<$type>()))};
         }
 
         ///
@@ -322,7 +322,7 @@ macro_rules! known_type {
             if self.data_ptr.align_offset(align_of::<$type>()) != 0 {
                 return None;
             }
-            return unsafe { Some(std::slice::from_raw_parts_mut(self.data_ptr.ptr().cast::<$type>(), self.limit / size_of::<$type>()))};
+            return unsafe { Some(std::slice::from_raw_parts_mut(self.data_ptr.inner().cast::<$type>(), self.limit / size_of::<$type>()))};
         }
 
         ///
@@ -361,8 +361,8 @@ impl HBuf {
     /// Caller must ensure that the pointer lives longer than HBuf and is valid.
     ///
     pub unsafe fn from_raw_parts(data: *mut u8, size: usize) -> HBuf {
-        return HBuf {
-            data_ptr: data.into(),
+        HBuf {
+            data_ptr: data.as_sync_mut(),
             capacity: size,
             limit: size,
             position: 0,
@@ -376,12 +376,9 @@ impl HBuf {
     /// If the HBuf is shared with other threads then the destructor may be called in any thread.
     ///
     pub unsafe fn from_raw_parts_with_destructor(data: *mut u8, size: usize, destructor: fn(*mut u8, usize)) -> HBuf {
-
-
-        //let addr: usize = unsafe {std::mem::transmute(destructor)};
-
-        return HBuf {
-            data_ptr: data.into(),
+        let data = data.as_sync_mut();
+        HBuf {
+            data_ptr: data,
             capacity: size,
             limit: size,
             position: 0,
@@ -395,7 +392,7 @@ impl HBuf {
     /// (It calls std::alloc::handle_alloc_error on out of memory)
     ///
     pub fn allocate(size: usize) -> HBuf {
-        return HBuf::allocate_aligned(size, 1);
+        HBuf::allocate_aligned(size, 1)
     }
 
     ///
@@ -404,7 +401,7 @@ impl HBuf {
     /// (It calls std::alloc::handle_alloc_error on out of memory)
     ///
     pub fn allocate_zeroed(size: usize) -> HBuf {
-        return HBuf::allocate_aligned_zeroed(size, 1);
+        HBuf::allocate_aligned_zeroed(size, 1)
     }
 
     ///
@@ -416,7 +413,7 @@ impl HBuf {
     pub fn allocate_aligned_zeroed(size: usize, alignment: usize) -> HBuf {
         let mut buf =  HBuf::allocate_aligned(size, alignment);
         buf.fill(0);
-        return buf;
+        buf
     }
 
     ///
@@ -446,13 +443,15 @@ impl HBuf {
             panic!("handle_alloc_error failed to panic or abort after OutOfMemory!");
         }
 
-        return HBuf {
-            data_ptr: data.into(),
+        let data = unsafe {data.as_sync_mut()};
+
+        HBuf {
+            data_ptr: data,
             capacity: size,
             limit: size,
             position: 0,
             destructor: Arc::new(Some(HBufDestructor::new(data, size, HBufDestructorInfo::Layout(layout))))
-        };
+        }
     }
 
     ///
@@ -460,7 +459,7 @@ impl HBuf {
     /// The memory does not have any particular alignment.
     ///
     pub fn try_allocate(size: usize) -> Result<HBuf, HBufError> {
-        return HBuf::try_allocate_aligned(size, 1);
+        HBuf::try_allocate_aligned(size, 1)
     }
 
     ///
@@ -472,7 +471,7 @@ impl HBuf {
     pub fn try_allocate_zeroed(size: usize) -> Result<HBuf, HBufError> {
         let mut buf = HBuf::try_allocate_aligned(size, 1)?;
         buf.fill(0);
-        return Ok(buf);
+        Ok(buf)
     }
 
     ///
@@ -486,7 +485,7 @@ impl HBuf {
     pub fn try_allocate_aligned_zeroed(size: usize, alignment: usize) -> Result<HBuf, HBufError> {
         let mut buf = HBuf::try_allocate_aligned(size, alignment)?;
         buf.fill(0);
-        return Ok(buf);
+        Ok(buf)
     }
 
     ///
@@ -512,13 +511,15 @@ impl HBuf {
             return Err(HBufError::LayoutError);
         }
 
-        return Ok(HBuf {
-            data_ptr: data.into(),
+        let data = unsafe {data.as_sync_mut()};
+
+        Ok(HBuf {
+            data_ptr: data,
             capacity: size,
             limit: size,
             position: 0,
             destructor: Arc::new(Some(HBufDestructor::new(data, size, HBufDestructorInfo::Layout(layout))))
-        });
+        })
     }
 
 
@@ -527,14 +528,14 @@ impl HBuf {
     /// Returns the reference count of the HBuf.
     ///
     pub fn ref_count(&self) -> usize {
-        return Arc::strong_count(&self.destructor);
+        Arc::strong_count(&self.destructor)
     }
 
     ///
     /// Returns true if this HBuf has a destructor that will run when all references to the HBuf are dropped.
     ///
     pub fn has_destructor(&self) -> bool {
-        return self.destructor.is_none();
+        self.destructor.is_none()
     }
 
     ///
@@ -571,7 +572,7 @@ impl HBuf {
     /// Returns the pointer to the start of the HBuf
     ///
     pub fn as_ptr(&self) -> *mut u8 {
-        self.data_ptr.ptr()
+        self.data_ptr.inner()
     }
 
     ///
@@ -579,7 +580,7 @@ impl HBuf {
     /// The size of the slice is the current limit.
     ///
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.data_ptr.ptr(), self.limit) }
+        unsafe { std::slice::from_raw_parts(self.data_ptr.inner(), self.limit) }
     }
 
     ///
@@ -587,7 +588,7 @@ impl HBuf {
     /// The size of the slice is the current limit.
     ///
     pub fn as_mut_slice(&self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.data_ptr.ptr(), self.limit) }
+        unsafe { std::slice::from_raw_parts_mut(self.data_ptr.inner(), self.limit) }
     }
 
     ///
@@ -598,7 +599,7 @@ impl HBuf {
         if self.data_ptr.align_offset(align_of::<T>()) != 0 {
             return None;
         }
-        return Some(std::slice::from_raw_parts(self.data_ptr.ptr().cast::<T>(), self.limit / size_of::<T>()));
+        Some(std::slice::from_raw_parts(self.data_ptr.inner().cast::<T>(), self.limit / size_of::<T>()))
     }
 
     ///
@@ -609,7 +610,7 @@ impl HBuf {
         if self.data_ptr.align_offset(align_of::<T>()) != 0 {
             return None;
         }
-        return Some(std::slice::from_raw_parts_mut(self.data_ptr.ptr().cast::<T>(), self.limit / size_of::<T>()));
+        Some(std::slice::from_raw_parts_mut(self.data_ptr.inner().cast::<T>(), self.limit / size_of::<T>()))
     }
 
     ///
@@ -621,7 +622,7 @@ impl HBuf {
         if index+sz-1 >= self.limit {
             panic!("Index {} is out of bounds for HBuffer with limit {}", index+sz-1, self.limit);
         }
-        unsafe { return self.data_ptr.wrapping_add(index).cast::<T>().read_unaligned(); }
+        unsafe { self.data_ptr.wrapping_add(index).cast::<T>().read_unaligned() }
     }
 
     ///
@@ -642,7 +643,7 @@ impl HBuf {
             panic!("Index {} is not properly aligned for {}", index+sz-1, align_of::<T>());
         }
 
-        return ptr.cast::<T>().as_ref().unwrap();
+        ptr.cast::<T>().as_ref().unwrap()
     }
 
     ///
@@ -663,7 +664,7 @@ impl HBuf {
             panic!("Index {} is not properly aligned for {}", index+sz-1, align_of::<T>());
         }
 
-        return ptr.cast::<T>().as_mut().unwrap();
+        ptr.cast::<T>().as_mut().unwrap()
     }
 
 
@@ -782,7 +783,7 @@ impl HBuf {
             return None;
         }
         unsafe {
-            return Some(std::slice::from_raw_parts(self.data_ptr.ptr().cast::<AtomicPtr<T>>(), self.limit / size_of::<AtomicPtr<T>>()));
+            Some(std::slice::from_raw_parts(self.data_ptr.inner().cast::<AtomicPtr<T>>(), self.limit / size_of::<AtomicPtr<T>>()))
         }
     }
 
@@ -806,7 +807,7 @@ impl HBuf {
             return None;
         }
         unsafe {
-            return Some(<AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()));
+            Some(<AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()))
         }
     }
 
@@ -823,7 +824,7 @@ impl HBuf {
         let ptr = self.data_ptr.wrapping_add(index);
         debug_assert_eq!(ptr.align_offset(align_of::<AtomicPtr<T>>()), 0);
         unsafe {
-            return <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).load(ordering);
+            <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).load(ordering)
         }
     }
 
@@ -840,7 +841,7 @@ impl HBuf {
         let ptr = self.data_ptr.wrapping_add(index);
         debug_assert_eq!(ptr.align_offset(align_of::<AtomicPtr<T>>()), 0);
         unsafe {
-            return <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).store(value, ordering);
+            <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).store(value, ordering)
         }
     }
 
@@ -857,7 +858,7 @@ impl HBuf {
         let ptr = self.data_ptr.wrapping_add(index);
         debug_assert_eq!(ptr.align_offset(align_of::<AtomicPtr<T>>()), 0);
         unsafe {
-            return <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).swap(value, ordering);
+            <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).swap(value, ordering)
         }
     }
 
@@ -874,7 +875,7 @@ impl HBuf {
         let ptr = self.data_ptr.wrapping_add(index);
         debug_assert_eq!(ptr.align_offset(align_of::<AtomicPtr<T>>()), 0);
         unsafe {
-            return <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).compare_exchange(current, update, success_ordering, failure_ordering);
+            <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).compare_exchange(current, update, success_ordering, failure_ordering)
         }
     }
 
@@ -891,7 +892,7 @@ impl HBuf {
         let ptr = self.data_ptr.wrapping_add(index);
         debug_assert_eq!(ptr.align_offset(align_of::<AtomicPtr<T>>()), 0);
         unsafe {
-            return <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).compare_exchange(current, update, success_ordering, failure_ordering);
+            <AtomicPtr<T>>::from_ptr(ptr.cast::<*mut T>()).compare_exchange(current, update, success_ordering, failure_ordering)
         }
     }
 
@@ -931,7 +932,7 @@ impl HBuf {
             self.position = self.limit;
         }
 
-        return true;
+        true
     }
 
     ///
@@ -956,7 +957,7 @@ impl HBuf {
             return false;
         }
         self.position = new_position;
-        return true;
+        true
     }
 
     ///
@@ -991,8 +992,8 @@ impl HBuf {
             panic!("Cannot split of a HBuf with {} bytes at offset {} because the capacity of the source buffer is only {}", length, off, self.capacity);
         }
 
-        return HBuf {
-            data_ptr: self.data_ptr.wrapping_add(off).into(),
+        HBuf {
+            data_ptr: unsafe {self.data_ptr.wrapping_add(off).as_sync_mut()},
             capacity: length,
             limit: length,
             position: 0,
@@ -1013,13 +1014,13 @@ impl HBuf {
             return None;
         }
 
-        return Some(HBuf {
-            data_ptr: self.data_ptr.wrapping_add(off).into(),
+        Some(HBuf {
+            data_ptr: unsafe {self.data_ptr.wrapping_add(off).as_sync_mut()},
             capacity: length,
             limit: length,
             position: 0,
             destructor: self.destructor.clone(),
-        });
+        })
     }
 
     fn seek_start(&mut self, from: u64) -> bool {
@@ -1028,7 +1029,7 @@ impl HBuf {
         }
 
         self.position = from as usize;
-        return true;
+        true
     }
 
     fn seek_end(&mut self, from: i64) -> bool {
@@ -1042,7 +1043,7 @@ impl HBuf {
         }
 
         self.position = self.limit - from as usize;
-        return true;
+        true
     }
 
     fn seek_cur(&mut self, from: i64) -> bool {
@@ -1051,7 +1052,7 @@ impl HBuf {
             return false;
         }
 
-        return self.seek_start(pos as u64);
+        self.seek_start(pos as u64)
     }
 
 
@@ -1070,7 +1071,7 @@ impl Seek for HBuf {
             return Ok(self.position as u64);
         }
 
-        return Err(Error::new(ErrorKind::UnexpectedEof, "out of bounds"));
+        Err(Error::new(ErrorKind::UnexpectedEof, "out of bounds"))
     }
 }
 
@@ -1082,12 +1083,12 @@ impl Write for HBuf {
         }
 
         self.position = self.position + to_copy;
-        return Ok(to_copy);
+        Ok(to_copy)
     }
 
     fn flush(&mut self) -> io::Result<()> {
         //NOOP
-        return Ok(());
+        Ok(())
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
@@ -1101,7 +1102,7 @@ impl Write for HBuf {
 
         unsafe { std::ptr::copy(buf.as_ptr(), self.data_ptr.wrapping_add(self.position), buf.len()) }
         self.position = self.position + buf.len();
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -1113,7 +1114,7 @@ impl Read for HBuf {
         }
         unsafe { std::ptr::copy(self.data_ptr.wrapping_add(self.position), buf.as_mut_ptr(), to_copy) }
         self.position = self.position + to_copy;
-        return Ok(to_copy);
+        Ok(to_copy)
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
@@ -1124,7 +1125,7 @@ impl Read for HBuf {
         let sl = unsafe { std::slice::from_raw_parts(self.data_ptr.wrapping_add(self.position), to_copy) };
         buf.write_all(sl)?;
         self.position = self.limit;
-        return Ok(to_copy);
+        Ok(to_copy)
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
@@ -1137,13 +1138,13 @@ impl Read for HBuf {
         }
         unsafe { std::ptr::copy(self.data_ptr.wrapping_add(self.position), buf.as_mut_ptr(), buf.len()) }
         self.position = self.position + buf.len();
-        return Ok(());
+        Ok(())
     }
 }
 
 impl Clone for HBuf {
     fn clone(&self) -> Self {
-        return HBuf {
+        HBuf {
             data_ptr: self.data_ptr.clone(),
             capacity: self.capacity,
             limit: self.limit,
@@ -1161,7 +1162,7 @@ impl Index<usize> for HBuf {
         if index >= self.limit {
             panic!("Index {} is out of bounds for HBuf with limit {}", index, self.limit);
         }
-        unsafe { return &*self.data_ptr.wrapping_add(index); }
+        unsafe { &*self.data_ptr.wrapping_add(index) }
     }
 }
 
@@ -1170,7 +1171,7 @@ impl IndexMut<usize> for HBuf {
         if index >= self.limit {
             panic!("Index {} is out of bounds for HBuf with limit {}", index, self.limit);
         }
-        unsafe { return &mut *self.data_ptr.wrapping_add(index); }
+        unsafe { &mut *self.data_ptr.wrapping_add(index) }
     }
 }
 

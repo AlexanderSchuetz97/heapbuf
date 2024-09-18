@@ -19,7 +19,7 @@ This library supports the following crates and their datatypes
 If you would like to enable all features then for your convenience a "all" feature exists.
 ```toml
 [dependencies]
-heapbuf = {version = "0.0.1", features = ["all"]}
+heapbuf = {version = "0.1.1", features = ["all"]}
 ```
 
 # Examples

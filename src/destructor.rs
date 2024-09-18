@@ -1,9 +1,9 @@
 use std::alloc::Layout;
-use crate::sync_ptr::SyncPtr;
+use sync_ptr::SyncMutPtr;
 
 #[derive(Debug)]
 pub(crate) struct HBufDestructor {
-    data_ptr: SyncPtr,
+    data_ptr: SyncMutPtr<u8>,
     capacity: usize,
     destructor_info: HBufDestructorInfo
 }
@@ -15,9 +15,9 @@ pub(crate) enum HBufDestructorInfo {
 }
 
 impl HBufDestructor {
-    pub(crate) fn new(data_ptr: *mut u8, capacity: usize, destructor_info: HBufDestructorInfo) -> HBufDestructor {
-        return HBufDestructor {
-            data_ptr: data_ptr.into(),
+    pub(crate) fn new(data_ptr: SyncMutPtr<u8>, capacity: usize, destructor_info: HBufDestructorInfo) -> HBufDestructor {
+        HBufDestructor {
+            data_ptr,
             capacity,
             destructor_info
         }
@@ -27,8 +27,8 @@ impl HBufDestructor {
 impl Drop for HBufDestructor {
     fn drop(&mut self) {
         match self.destructor_info {
-            HBufDestructorInfo::Layout(lay) => unsafe { std::alloc::dealloc(self.data_ptr.ptr(), lay) }
-            HBufDestructorInfo::Destructor(destructor_fn) => destructor_fn(self.data_ptr.ptr(), self.capacity)
+            HBufDestructorInfo::Layout(lay) => unsafe { std::alloc::dealloc(self.data_ptr.inner(), lay) }
+            HBufDestructorInfo::Destructor(destructor_fn) => destructor_fn(self.data_ptr.inner(), self.capacity)
         }
     }
 }
