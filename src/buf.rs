@@ -353,6 +353,19 @@ macro_rules! known_type {
     };
 }
 
+
+///
+/// Trait to allow implementing a custom Destructor in rust.
+/// This is usefully if your destructor requires more state than just the pointer.
+///
+pub trait DynDestructor: Send+Sync+Debug {
+
+    ///
+    /// This function is called exactly once per pointer.
+    ///
+    fn destroy(&mut self, ptr: *mut u8, size: usize);
+}
+
 impl HBuf {
 
     ///
@@ -372,8 +385,8 @@ impl HBuf {
 
     ///
     /// Creates a HBuf from a pointer.
-    /// Dropping the resulting HBuf will call the provided destructor function.
-    /// If the HBuf is shared with other threads then the destructor may be called in any thread.
+    /// Dropping the resulting HBuf will call the provided destructor function once no more references to the HBuf exist.
+    /// If the HBuf is shared with other threads then the destructor will be called in whichever thread drops it last.
     ///
     pub unsafe fn from_raw_parts_with_destructor(data: *mut u8, size: usize, destructor: fn(*mut u8, usize)) -> HBuf {
         let data = data.as_sync_mut();
@@ -383,6 +396,22 @@ impl HBuf {
             limit: size,
             position: 0,
             destructor: Arc::new(Some(HBufDestructor::new(data, size, HBufDestructorInfo::Destructor(destructor))))
+        }
+    }
+
+    ///
+    /// Creates a HBuf from a pointer.
+    /// Dropping the resulting HBuf will call the provided destructor function once no more references to the HBuf exist.
+    /// If the HBuf is shared with other threads then the destructor will be called in whichever thread drops it last.
+    ///
+    pub unsafe fn from_raw_parts_with_dyn_destructor(data: *mut u8, size: usize, destructor: Box<dyn DynDestructor>) -> HBuf {
+        let data = data.as_sync_mut();
+        HBuf {
+            data_ptr: data,
+            capacity: size,
+            limit: size,
+            position: 0,
+            destructor: Arc::new(Some(HBufDestructor::new(data, size, HBufDestructorInfo::DynDestructor(destructor))))
         }
     }
 
