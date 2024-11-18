@@ -5,6 +5,7 @@ use std::io;
 use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::{align_of, size_of};
 use std::ops::{Deref, DerefMut, Index, IndexMut};
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use sync_ptr::{FromMutPtr, SyncMutPtr};
@@ -358,7 +359,7 @@ macro_rules! known_type {
 /// Trait to allow implementing a custom Destructor in rust.
 /// This is usefully if your destructor requires more state than just the pointer.
 ///
-pub trait DynDestructor: Send+Sync+Debug {
+pub trait DynDestructor: Send+Sync+Debug+RefUnwindSafe+UnwindSafe {
 
     ///
     /// This function is called exactly once per pointer.
@@ -1222,4 +1223,10 @@ impl DerefMut for HBuf {
 #[test]
 fn test_sync() {
     static_assertions::assert_impl_all!(HBuf: Sync);
+}
+#[cfg(test)]
+#[test]
+fn test_unwind() {
+    static_assertions::assert_impl_all!(HBuf: RefUnwindSafe);
+    static_assertions::assert_impl_all!(HBuf: UnwindSafe);
 }
